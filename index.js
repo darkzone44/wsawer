@@ -518,4 +518,6 @@ async function startSession(config) {
 
 // Start express server
 app.listen(PORT, () => {
-  console.log
+  console.log(`✅ Server running at http://localhost:${PORT} (PID: ${process.pid})`);
+  console.log("Open the URL and start the session. Check your terminal for QR and logs.");
+});
