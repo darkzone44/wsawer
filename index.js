@@ -1,451 +1,521 @@
-const express = require('express');
-const fs = require('fs');
-const pino = require('pino');
-const path = require('path');
-const crypto = require('crypto');
-const { makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require("@whiskeysockets/baileys");
-const multer = require('multer');
+/**
+ * index.js
+ * Full WhatsApp auto-sender server using Baileys (complete, original-style).
+ *
+ * Instructions:
+ * 1. Place this file as index.js in your project.
+ * 2. Ensure package.json includes dependencies:
+ *    - @adiwajshing/baileys
+ *    - express
+ *    - body-parser
+ *    - multer
+ *    - @hapi/boom
+ * 3. Run: npm install && node index.js
+ * 4. Open http://localhost:3000 and use the form. For a session, either:
+ *    - Create a folder named the session key (e.g. "session") and upload creds files there
+ *    - Or use the upload creds endpoint to upload creds.json via the web UI
+ *
+ * Note: Always keep backups of your session credentials. If the session is logged out, delete folder and re-authenticate.
+ */
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@adiwajshing/baileys");
+const { Boom } = require("@hapi/boom");
 
 const app = express();
-const port = 5000;
+const PORT = process.env.PORT || 3000;
 
-let messages = null;
-let targetNumbers = [];
-let groupUIDs = [];
-let intervalTime = null;
-let haterName = null;
+// Multer setup for file uploads (upload creds.json)
+const upload = multer({ dest: path.join(__dirname, "uploads/") });
 
-const activeSessions = new Map(); // sessionKey => { running: true, ... }
+// Ensure uploads folder exists
+if (!fs.existsSync(path.join(__dirname, "uploads"))) {
+  fs.mkdirSync(path.join(__dirname, "uploads"));
+}
 
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+/**
+ * activeSessions map:
+ * key: sessionKey (string)
+ * value: {
+ *   sock: Baileys socket,
+ *   running: boolean,
+ *   targets: {numbers:[], groups:[]},
+ *   config: { interval, prefix, messages, sessionKey }
+ * }
+ */
+const activeSessions = new Map();
 
-// ======= Stylish HTML Route =======
-app.get('/', (req, res) => {
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Utility: normalizeTargetList
+ * - Accepts comma-separated inputs of numbers or JIDs
+ * - Cleans whitespace and non-digit characters (except @ and . and - and _)
+ * - Auto-adds country code 91 for 10-digit Indian numbers
+ * - Removes accidental double suffix additions later when building JID
+ */
+function normalizeTargetList(rawStr) {
+  if (!rawStr) return [];
+  return rawStr
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      // Allow numbers with +, spaces removed
+      let x = s.replace(/\s+/g, "");
+      // Remove characters except digits and @ . _ - + (for JIDs)
+      x = x.replace(/[^0-9@._\-\+]/g, "");
+      // If it's a plain number (no @) and length 10, assume India and add 91
+      if (!x.includes("@")) {
+        // remove leading plus if present
+        let y = x.startsWith("+") ? x.slice(1) : x;
+        if (y.length === 10) return "91" + y;
+        if (y.length === 11 && y.startsWith("0")) return "91" + y.slice(1);
+        return y; // could be already with country code
+      }
+      // If contains @ (user provided JID), return as is
+      return x;
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Build proper JID for sending:
+ * - For numbers (no '@'), append @s.whatsapp.net
+ * - For group ids, ensure @g.us
+ * - If user provided a full JID, keep it
+ */
+function buildJid(target, expectedType = "user") {
+  // expectedType: 'user' or 'group'
+  if (target.includes("@")) {
+    // sanitize accidental double suffix by trimming spaces
+    return target.trim();
+  }
+  if (expectedType === "group") return `${target}@g.us`;
+  return `${target}@s.whatsapp.net`;
+}
+
+/**
+ * Endpoint: Home page with full original-style form (no cut)
+ * - Allows uploading session name, numbers/groups, messages, prefix, interval
+ * - Also supports uploading a creds.json file via separate endpoint below
+ */
+app.get("/", (req, res) => {
   res.send(`
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>😈𝗠𝗥 𝗡𝗜𝗜𝗧𝗘𝗦𝗛 𝗪𝗣 𝗟𝗢𝗗𝗘𝗥😈</title>
-  <link href="https://fonts.googleapis.com/css?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-  <style>
-    body {
-      min-height: 100vh;
-      margin: 0;
-      padding: 0;
-      font-family: 'Poppins', Arial, sans-serif;
-      background: linear-gradient(135deg, #1f1c2c 0%, #928dab 100%);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: flex-start;
-    }
-    .top-title {
-      margin-top: 32px;
-      font-size: 2.2rem;
-      font-weight: bold;
-      letter-spacing: 2px;
-      color: #fff;
-      text-shadow: 0 2px 8px #000, 0 0 5px #ffd200;
-      text-align: center;
-      background: linear-gradient(90deg, #ff00cc, #00ffd0 60%, #ff00cc);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      animation: shine 2.5s linear infinite;
-    }
-    @keyframes shine {
-      0% { filter: brightness(1);}
-      50% { filter: brightness(1.4);}
-      100% { filter: brightness(1);}
-    }
-    .cred-link {
-      margin: 18px 0 18px 0;
-      font-size: 1.1rem;
-      font-weight: 600;
-      background: #fff;
-      color: #222;
-      padding: 10px 22px;
-      border-radius: 16px;
-      box-shadow: 0 2px 12px #0002;
-      text-decoration: none;
-      display: inline-block;
-      transition: background 0.3s, color 0.3s;
-    }
-    .cred-link:hover {
-      background: #ffd200;
-      color: #0f2027;
-    }
-    .glass-box {
-      background: linear-gradient(120deg,rgba(0,255,255,0.18),rgba(255,0,204,0.13));
-      border-radius: 22px;
-      box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
-      backdrop-filter: blur(12px);
-      border: 2.5px solid #00ffd0aa;
-      padding: 36px 24px 24px 24px;
-      max-width: 420px;
-      width: 98vw;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      animation: pop-in 0.7s cubic-bezier(.68,-0.55,.27,1.55);
-    }
-    @keyframes pop-in {
-      0% { transform: scale(0.8); opacity: 0; }
-      100% { transform: scale(1); opacity: 1; }
-    }
-    form {
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-      width: 100%;
-    }
-    label {
-      color: #fff;
-      font-weight: 500;
-      margin-bottom: 3px;
-      letter-spacing: 0.5px;
-      font-size: 1rem;
-    }
-    input, select {
-      padding: 11px;
-      border-radius: 8px;
-      border: 1.7px solid #ff00cc;
-      background: rgba(16,16,16,0.85);
-      color: #fff;
-      font-size: 1rem;
-      outline: none;
-      transition: border 0.2s;
-      width: 100%;
-    }
-    input:focus, select:focus {
-      border: 1.7px solid #00ffd0;
-    }
-    input[type="file"] {
-      background: transparent;
-      color: #fff;
-      border: none;
-      padding-left: 0;
-    }
-    .btn {
-      background: linear-gradient(90deg, #ff512f, #dd2476, #1fa2ff);
-      color: #fff;
-      border: none;
-      border-radius: 11px;
-      font-size: 1.11rem;
-      font-weight: bold;
-      padding: 13px 0;
-      margin-top: 10px;
-      box-shadow: 0 2px 8px #ff00cca0;
-      cursor: pointer;
-      transition: background 0.3s, box-shadow 0.3s, color 0.3s, transform 0.2s;
-      letter-spacing: 1px;
-      width: 100%;
-    }
-    .btn:hover {
-      background: linear-gradient(90deg, #1fa2ff, #ff512f, #dd2476);
-      color: #121212;
-      box-shadow: 0 4px 16px #00ffd0a0;
-      transform: scale(1.06);
-    }
-    @media (max-width: 600px) {
-      .glass-box {
-        padding: 14px 2vw 10px 2vw;
-        max-width: 99vw;
+  <html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WhatsApp Auto Sender (Complete)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      body { background: #080808; color: #e6fffa; font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 20px; }
+      .container { max-width: 900px; margin: 0 auto; background: #0f1720; border-radius: 8px; padding: 20px; box-shadow: 0 6px 30px rgba(0,0,0,0.6); }
+      h1 { text-align: center; color: #7ee7c7; }
+      label { display:block; margin-top:12px; color:#cdeedd; }
+      input[type="text"], textarea, select, input[type="number"] {
+        width: 100%; padding: 10px; margin-top:6px; background: #071018; color: #e6fffa; border: 1px solid #123; border-radius: 4px;
       }
-      .top-title {
-        font-size: 1.3rem;
-      }
-    }
-    .footer {
-      margin-top: 38px;
-      color: #fff;
-      font-size: 1.1rem;
-      font-weight: 600;
-      text-align: center;
-      letter-spacing: 1px;
-      text-shadow: 0 0 8px #00ffd0;
-    }
-    .wp-logo {
-      margin: 24px 0 10px 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .wp-logo-icon {
-      width: 34px;
-      height: 34px;
-      background: #25D366;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin-right: 12px;
-      box-shadow: 0 2px 8px #0004;
-    }
-    .wp-logo-icon svg {
-      width: 22px;
-      height: 22px;
-      fill: #fff;
-    }
-    .wp-number {
-      font-size: 1.2rem;
-      font-weight: bold;
-      letter-spacing: 1px;
-      color: #fff;
-      text-shadow: 0 1px 4px #2228;
-    }
-  </style>
-  <script>
-    function toggleFields() {
-      const targetOption = document.getElementById("targetOption").value;
-      if (targetOption === "1") {
-        document.getElementById("numbersField").style.display = "block";
-        document.getElementById("groupUIDsField").style.display = "none";
-      } else if (targetOption === "2") {
-        document.getElementById("groupUIDsField").style.display = "block";
-        document.getElementById("numbersField").style.display = "none";
-      }
-    }
-    window.onload = function() { toggleFields(); }
+      button { margin-top: 14px; padding: 10px 16px; background: #16a34a; color: white; border: none; border-radius: 6px; cursor:pointer; }
+      small { color:#9adbb8; }
+      .row { display:flex; gap:10px; }
+      .col { flex:1; }
+      .note { background:#041018; padding:10px; border-radius:4px; color:#aee8cc; margin-top:12px; }
+      .upload { background:#082124; padding:12px; border-radius:4px; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>WhatsApp Auto Sender — Full Edition</h1>
 
-    // AJAX for sending messages and showing session key
-    function handleSendForm(e) {
-      e.preventDefault();
-      const form = document.getElementById('sendForm');
-      const formData = new FormData(form);
+      <form action="/start" method="post" enctype="multipart/form-data">
+        <label>Session Key / Folder Name (create a folder with this name and put your creds files there, or upload creds using the form below)</label>
+        <input type="text" name="session" placeholder="session" required>
 
-      fetch('/send-messages', {
-        method: 'POST',
-        body: formData
-      })
-      .then(res => res.json())
-      .then(data => {
-        if(data.status === 'success') {
-          document.getElementById('sessionKeyBox').style.display = 'block';
-          document.getElementById('sessionKeyValue').innerText = data.sessionKey;
-          document.getElementById('sendMsgResult').innerText = "Message sending started! Use session key below to stop.";
-        } else {
-          document.getElementById('sendMsgResult').innerText = data.message || "Error!";
-        }
-      })
-      .catch(() => {
-        document.getElementById('sendMsgResult').innerText = "Server error!";
-      });
-    }
+        <label>Target Option</label>
+        <select name="targetOption">
+          <option value="1">Numbers (comma separated)</option>
+          <option value="2">Groups (Group IDs comma separated)</option>
+        </select>
 
-    // AJAX for stopping messages
-    function handleStopForm(e) {
-      e.preventDefault();
-      const form = document.getElementById('stopForm');
-      const formData = new FormData(form);
-      fetch('/stop', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionKey: formData.get('sessionKey') })
-      })
-      .then(res => res.json())
-      .then(data => {
-        document.getElementById('stopMsgResult').innerText = data.message || "Stopped!";
-      })
-      .catch(() => {
-        document.getElementById('stopMsgResult').innerText = "Server error!";
-      });
-    }
-  </script>
-</head>
-<body>
-  <div class="top-title">
-    😈𝗠𝗥 𝗡𝗶𝗶𝘁𝗲𝘀𝗵 𝘅𝗗 𝗪𝗣 𝗟𝗢𝗗𝗘𝗥😈
-  </div>
-  <a class="cred-link" href="https://knight-bot-paircode.onrender.com/" target="_blank">
-    CRED JSON DENE VALA LINK
-  </a>
-  <div class="glass-box">
-    <form id="sendForm" onsubmit="handleSendForm(event)" enctype="multipart/form-data">
-      <label for="creds">Upload creds.json:</label>
-      <input type="file" id="creds" name="creds" accept=".json" required>
-      <label for="targetOption">Select Target Option:</label>
-      <select name="targetOption" id="targetOption" onchange="toggleFields()" required>
-        <option value="1">Send to Target Number</option>
-        <option value="2">Send to WhatsApp Group</option>
-      </select>
-      <div id="numbersField">
-        <label for="numbers">Target Numbers (comma separated):</label>
-        <input type="text" id="numbers" name="numbers" placeholder="e.g. 919999999999,918888888888">
+        <label>Target Numbers (comma separated). Examples: 919876543210, 9876543210</label>
+        <textarea name="numbers" rows="2" placeholder="919876543210, 9876543210"></textarea>
+
+        <label>Group IDs (comma separated). Example: 1203630XXXXXXXX@g.us</label>
+        <textarea name="groupUIDsInput" rows="2" placeholder="1203630XXXXXXXX@g.us, 1203630YYYYYYYY@g.us"></textarea>
+
+        <label>Messages (comma separated). Example: Hello,How are you?,Good morning</label>
+        <textarea name="messages" rows="3" placeholder="Hello,How are you?,Good morning!"></textarea>
+
+        <div class="row">
+          <div class="col">
+            <label>Prefix (optional)</label>
+            <input type="text" name="haterName" placeholder="YourName: ">
+          </div>
+          <div class="col">
+            <label>Interval between cycles (seconds)</label>
+            <input type="number" name="intervalTime" value="5" min="1" />
+          </div>
+        </div>
+
+        <button type="submit">Start Sending</button>
+      </form>
+
+      <div class="upload">
+        <h3>Upload creds.json (Optional)</h3>
+        <small>If you have a creds.json (or multi-file creds) you can upload it to a session folder using this form.</small>
+        <form action="/upload-creds" enctype="multipart/form-data" method="post">
+          <label>Session folder to save to</label>
+          <input type="text" name="session" placeholder="session" required />
+          <label>Choose file (select your creds.json or zipped creds)</label>
+          <input type="file" name="credsfile" required />
+          <button type="submit">Upload creds</button>
+        </form>
+        <div class="note">
+          <strong>Important:</strong> Keep a backup of your session folder. If session gets logged out, remove folder and re-scan QR.
+        </div>
       </div>
-      <div id="groupUIDsField" style="display:none;">
-        <label for="groupUIDsInput">Group UIDs (comma separated):</label>
-        <input type="text" id="groupUIDsInput" name="groupUIDsInput" placeholder="e.g. 1203630xxxxx-123456@g.us">
+
+      <div class="note" style="margin-top:16px;">
+        <strong>Logs/Status:</strong> After starting, open the terminal where node is running to view logs — connection status, sent success/failure, and message updates will be printed there.
       </div>
-      <label for="messageFile">Upload Message File (.txt):</label>
-      <input type="file" id="messageFile" name="messageFile" accept=".txt" required>
-      <label for="haterNameInput">Enter Hater's Name:</label>
-      <input type="text" id="haterNameInput" name="haterNameInput" placeholder="e.g. Mr. Nitesh xD" required>
-      <label for="delayTime">Delay Between Messages (seconds):</label>
-      <input type="number" id="delayTime" name="delayTime" min="1" value="2" required>
-      <button class="btn" type="submit">🚀 Start Sending</button>
-      <div id="sendMsgResult" style="color:#00ffd0;margin-top:10px;text-align:center;"></div>
-    </form>
-    <div class="session-key-box" id="sessionKeyBox" style="margin-top:18px;background:linear-gradient(90deg,#00ffd0cc,#ff00cccc 80%);color:#121212;border-radius:10px;padding:12px 10px;font-size:1.1rem;text-align:center;word-break:break-all;box-shadow:0 0 8px #ff00cca0;display:none;">
-      <b>Session Key:</b>
-      <div id="sessionKeyValue" style="font-size:1.2rem;margin:8px 0;"></div>
-      <span style="font-size:0.95rem;">Copy this key to stop messages below.</span>
     </div>
-    <form id="stopForm" class="stop-form" onsubmit="handleStopForm(event)">
-      <label for="sessionKey">Enter Session Key to Stop:</label>
-      <input type="text" id="sessionKey" name="sessionKey" placeholder="Paste session key here" required>
-      <button class="btn" type="submit" style="background:linear-gradient(90deg,#00ffd0,#ff00cc 80%);color:#fff;">🛑 Stop Sending</button>
-      <div id="stopMsgResult" style="color:#ff00cc;text-align:center;"></div>
-    </form>
-  </div>
-  <div class="footer">
-    😋 𝗠𝗔𝗗𝗘 𝗕𝗬 𝗡𝗶𝗶𝘁𝗲𝘀𝗵 𝘅𝗗 =𝟮𝟬𝟮𝟱
-  </div>
-  <div class="wp-logo">
-    <span class="wp-logo-icon">
-      <svg viewBox="0 0 32 32">
-        <path d="M16 2.5C8.3 2.5 2 8.8 2 16.5c0 2.9 0.8 5.7 2.3 8.1L2 30l5.6-2.2c2.3 1.3 4.9 2 7.4 2 7.7 0 14-6.3 14-14S23.7 2.5 16 2.5zm0 25.5c-2.3 0-4.6-0.6-6.6-1.8l-0.5-0.3-3.3 1.3 0.7-3.4-0.3-0.5C4.9 20.1 4.2 18.3 4.2 16.5c0-6.5 5.3-11.8 11.8-11.8s11.8 5.3 11.8 11.8-5.3 11.8-11.8 11.8zm6.2-8.7c-0.3-0.2-1.6-0.8-1.8-0.9-0.2-0.1-0.4-0.2-0.6 0.2-0.2 0.3-0.7 0.9-0.9 1.1-0.2 0.2-0.3 0.2-0.6 0.1-0.3-0.2-1.2-0.4-2.2-1.1-0.8-0.7-1.3-1.5-1.5-1.7-0.2-0.3 0-0.4 0.1-0.6 0.1-0.1 0.2-0.3 0.3-0.4 0.1-0.1 0.1-0.2 0.2-0.3 0.1-0.1 0-0.2 0-0.3-0.1-0.2-0.6-1.5-0.8-2.1-0.2-0.5-0.4-0.5-0.6-0.5-0.2 0-0.4 0-0.6 0-0.2 0-0.5 0.1-0.7 0.3-0.2 0.2-0.7 0.7-0.7 1.7s0.7 2 0.8 2.1c0.1 0.1 1.4 2.2 3.5 3 0.5 0.2 0.9 0.3 1.2 0.4 0.5 0.1 0.9 0.1 1.2 0.1 0.4 0 1.2-0.2 1.4-0.6 0.2-0.3 0.2-0.7 0.1-0.8z"/>
-      </svg>
-    </span>
-    <span class="wp-number">9779800640944</span>
-  </div>
-</body>
-</html>
+  </body>
+  </html>
   `);
 });
 
-// ======= Main Message Sending Endpoint (with creds.json, session key) =======
-app.post('/send-messages', upload.fields([
-  { name: 'creds', maxCount: 1 },
-  { name: 'messageFile', maxCount: 1 }
-]), async (req, res) => {
+/**
+ * Endpoint: Upload creds file to a session folder
+ * - Accepts file under 'credsfile' and 'session' name field
+ * - Saves uploaded file into session folder (useful for Render where you can't manually upload)
+ * - If zip file uploaded, don't auto-extract (user can extract manually). We keep it safe.
+ */
+app.post("/upload-creds", upload.single("credsfile"), async (req, res) => {
   try {
-    const { targetOption, numbers, groupUIDsInput, delayTime, haterNameInput } = req.body;
-
-    // creds.json required
-    if (!req.files['creds']) {
-      return res.json({ status: 'error', message: 'creds.json file is required!' });
+    const session = req.body.session || "session";
+    const destFolder = path.join(__dirname, session);
+    if (!fs.existsSync(destFolder)) {
+      fs.mkdirSync(destFolder, { recursive: true });
     }
-    const credsBuffer = req.files['creds'][0].buffer;
+    const file = req.file;
+    if (!file) return res.status(400).send("No file uploaded.");
+    const destPath = path.join(destFolder, file.originalname);
+    fs.renameSync(file.path, destPath);
+    return res.send(`✅ File uploaded to session folder: ${session} as ${file.originalname}`);
+  } catch (err) {
+    console.error("Upload error:", err);
+    return res.status(500).send("Upload failed: " + err.message);
+  }
+});
 
-    haterName = haterNameInput;
-    intervalTime = parseInt(delayTime, 10);
+/**
+ * Endpoint: Start sending
+ * - Expects: session, targetOption, numbers, groupUIDsInput, messages, haterName, intervalTime
+ * - Will spawn a session if not already started
+ */
+app.post("/start", async (req, res) => {
+  try {
+    const { session, numbers, groupUIDsInput, targetOption, messages, haterName, intervalTime } = req.body;
+    const sessionKey = (session || "session").trim();
+    if (!sessionKey) return res.status(400).send("Session key required.");
 
-    if (req.files['messageFile']) {
-      messages = req.files['messageFile'][0].buffer.toString('utf-8').split('\n').filter(Boolean);
-    } else {
-      return res.json({ status: 'error', message: 'No message file uploaded' });
+    if (activeSessions.has(sessionKey) && activeSessions.get(sessionKey).running) {
+      return res.send(`⚠️ Session "${sessionKey}" is already running. Use /stop to stop it before starting again.`);
     }
 
+    // Normalize messages
+    const messageList = (messages || "")
+      .split(",")
+      .map((m) => m.trim())
+      .filter(Boolean);
+
+    if (!messageList.length) {
+      return res.status(400).send("Please provide at least one message (comma separated).");
+    }
+
+    // Normalize targets
+    let targetNumbers = [];
+    let groupUIDs = [];
     if (targetOption === "1") {
-      targetNumbers = numbers.split(',').map(x => x.replace(/[^0-9]/g, '').trim()).filter(x => x.length > 8);
-      groupUIDs = [];
-    } else if (targetOption === "2") {
-      groupUIDs = groupUIDsInput.split(',').map(x => x.trim()).filter(x => x);
-      targetNumbers = [];
+      targetNumbers = normalizeTargetList(numbers || "");
+    } else {
+      groupUIDs = (groupUIDsInput || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     }
 
-    // --- Session Key Logic ---
-    const sessionKey = crypto.randomBytes(8).toString('hex');
-    const sessionDir = path.join(__dirname, 'sessions', sessionKey);
-    fs.mkdirSync(sessionDir, { recursive: true });
-    fs.writeFileSync(path.join(sessionDir, 'creds.json'), credsBuffer);
+    // Save config
+    const config = {
+      sessionKey,
+      targetNumbers,
+      groupUIDs,
+      messages: messageList,
+      prefix: haterName || "",
+      interval: parseInt(intervalTime) || 5,
+    };
 
-    activeSessions.set(sessionKey, { running: true });
-
-    sendMessages(sessionKey, sessionDir, messages, targetNumbers, groupUIDs, intervalTime, haterName);
-
-    res.json({
-      status: 'success',
-      message: 'Message sending started!',
-      sessionKey
+    // Start session asynchronously (we won't wait for completion — but we will start it now)
+    startSession(config).catch((e) => {
+      console.error("Failed to start session:", e);
     });
 
-  } catch (error) {
-    res.json({ status: 'error', message: error.message });
+    return res.send(`✅ Session "${sessionKey}" starting... Check server console logs for details.`);
+  } catch (err) {
+    console.error("Start error:", err);
+    return res.status(500).send("Start failed: " + err.message);
   }
 });
 
-// ======= Stop Session =======
-app.post('/stop', express.json(), (req, res) => {
-  const { sessionKey } = req.body;
-  if (activeSessions.has(sessionKey)) {
-    activeSessions.get(sessionKey).running = false;
-    const sessionDir = path.join(__dirname, 'sessions', sessionKey);
-    fs.rmSync(sessionDir, { recursive: true, force: true });
+/**
+ * Endpoint: Stop a session or all sessions
+ * - /stop?session=sessionKey   -> stops specific session
+ * - /stop                     -> stops all sessions
+ */
+app.get("/stop", (req, res) => {
+  const sessionKey = req.query.session;
+  if (sessionKey) {
+    const s = activeSessions.get(sessionKey);
+    if (!s) return res.send(`No active session named "${sessionKey}".`);
+    s.running = false;
     activeSessions.delete(sessionKey);
-    res.json({ status: 'success', message: 'Session stopped' });
+    return res.send(`🛑 Session "${sessionKey}" stopped.`);
   } else {
-    res.status(404).json({ status: 'error', message: 'Invalid session key' });
+    activeSessions.forEach((s, k) => {
+      s.running = false;
+      activeSessions.delete(k);
+    });
+    return res.send("🛑 All sessions stopped.");
   }
 });
 
-// ======= Message Sending Logic (with sessionKey) =======
-const sendMessages = async (sessionKey, sessionDir, messages, targetNumbers, groupUIDs, intervalTime, haterName) => {
-  async function connectSocket() {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const sock = makeWASocket({
-      logger: pino({ level: 'silent' }),
-      auth: state,
+/**
+ * Endpoint: Status - list active sessions and their basic info
+ */
+app.get("/status", (req, res) => {
+  const out = [];
+  activeSessions.forEach((val, key) => {
+    out.push({
+      sessionKey: key,
+      running: val.running,
+      targets: { numbers: val.targets?.numbers?.length || 0, groups: val.targets?.groups?.length || 0 },
+      interval: val.config?.interval || null,
     });
-    sock.ev.on('creds.update', saveCreds);
-    return sock;
+  });
+  res.json(out);
+});
+
+/**
+ * Core: startSession
+ * - Creates/uses auth state from session folder
+ * - Boots Baileys socket
+ * - Attaches event handlers for connection updates & message updates
+ * - Starts the sending loop with robust try/catch and per-target logs
+ */
+async function startSession(config) {
+  const { sessionKey, targetNumbers, groupUIDs, messages, prefix, interval } = {
+    targetNumbers: [],
+    groupUIDs: [],
+    messages: [],
+    prefix: "",
+    interval: 5,
+    ...config,
+  };
+
+  console.log(`\n[${new Date().toISOString()}] Starting session "${sessionKey}"`);
+  console.log("Targets (numbers):", targetNumbers);
+  console.log("Targets (groups):", groupUIDs);
+  console.log("Messages:", messages);
+  console.log("Prefix:", prefix);
+  console.log("Interval (s):", interval);
+
+  // prepare session folder for multi-file auth
+  const sessionFolder = path.join(__dirname, sessionKey);
+  if (!fs.existsSync(sessionFolder)) {
+    fs.mkdirSync(sessionFolder, { recursive: true });
+    console.log(`Created session folder: ${sessionFolder}`);
   }
 
-  let sock = await connectSocket();
+  // Use multi-file auth state (safer; stores creds across multiple files)
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
 
-  sock.ev.on('connection.update', async (s) => {
-    const { connection, lastDisconnect } = s;
-    if (connection === "open") {
-      console.log("WhatsApp connected successfully.");
-    }
-    if (connection === "close" && lastDisconnect?.error) {
-      const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        console.log("Reconnecting...");
-        sock = await connectSocket();
-      } else {
-        console.log("Connection closed. Restart the script.");
+  const sock = makeWASocket({
+    printQRInTerminal: true,
+    auth: state,
+    // browser id - helps WhatsApp identify the session
+    browser: ["WhatsApp Auto Sender", "Safari", "1.0"],
+    // You can add more options here if needed
+  });
+
+  // Save creds whenever updated
+  sock.ev.on("creds.update", saveCreds);
+
+  // Store session meta for control endpoints
+  activeSessions.set(sessionKey, {
+    sock,
+    running: true,
+    targets: { numbers: targetNumbers.slice(), groups: groupUIDs.slice() },
+    config: { interval, prefix, messages, sessionKey },
+  });
+
+  // Listen for connection updates
+  sock.ev.on("connection.update", (update) => {
+    try {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        console.log(`[${sessionKey}] QR code received — scan it with WhatsApp Web to authenticate (terminal QR or printed).`);
       }
+      if (connection) {
+        console.log(`[${sessionKey}] Connection update: ${connection}`);
+      }
+      if (connection === "close") {
+        // Try to get reason
+        const reason = (lastDisconnect && lastDisconnect.error) ? new Boom(lastDisconnect.error).output.statusCode : null;
+        console.log(`[${sessionKey}] Connection closed. Reason code: ${reason}`);
+        // Logged out?
+        if (lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.payload) {
+          // Detect logged out by examining the error payload message - but simpler: use DisconnectReason if available
+        }
+        // If not logged out then try to restart after small delay
+        // NOTE: avoid infinite immediate restart — give a delay
+        (async () => {
+          // mark as not running
+          const s = activeSessions.get(sessionKey);
+          if (s) s.running = false;
+          console.log(`[${sessionKey}] Attempting to reconnect in 5 seconds...`);
+          await delay(5000);
+          // restart if folder still exists (user didn't stop)
+          if (fs.existsSync(sessionFolder)) {
+            console.log(`[${sessionKey}] Reinitializing session...`);
+            // Clean up old socket event listeners if any
+            try { sock.end(); } catch (e) {}
+            // start a new session (recursive)
+            startSession(config).catch((e) => console.error(`[${sessionKey}] Re-start failed:`, e));
+          } else {
+            console.log(`[${sessionKey}] Session folder removed; not reconnecting.`);
+          }
+        })();
+      } else if (connection === "open") {
+        console.log(`[${sessionKey}] ✅ WhatsApp connection opened successfully.`);
+      }
+    } catch (err) {
+      console.error(`[${sessionKey}] connection.update handler error:`, err);
     }
   });
 
-  let i = 0;
-  while (activeSessions.get(sessionKey)?.running) {
+  // Listen for message update events (delivered/read ack changes)
+  sock.ev.on("messages.update", (updates) => {
+    // updates is an array of update objects
     try {
-      const fullMessage = `${haterName} ${messages[i]}`;
-      if (targetNumbers.length > 0) {
-        for (const targetNumber of targetNumbers) {
-          await sock.sendMessage(targetNumber + '@s.whatsapp.net', { text: fullMessage });
-          console.log(`Message sent to target number: ${targetNumber}`);
-        }
-      }
-      if (groupUIDs.length > 0) {
-        for (const groupUID of groupUIDs) {
-          await sock.sendMessage(groupUID + '@g.us', { text: fullMessage });
-          console.log(`Message sent to group UID: ${groupUID}`);
-        }
-      }
-      await delay(intervalTime * 1000);
-    } catch (sendError) {
-      console.log(`Error sending message: ${sendError.message}. Retrying...`);
-      await delay(5000);
+      updates.forEach((u) => {
+        // Example u: { key: { remoteJid, id, fromMe }, update: { status } }
+        const key = u.key || {};
+        const remote = key.remoteJid || "unknown";
+        const id = key.id || "";
+        // u.update can contain status, or message etc depending on event shape
+        console.log(`[${sessionKey}] messages.update -> remote: ${remote} | id: ${id} | update: ${JSON.stringify(u.update)}`);
+      });
+    } catch (err) {
+      console.error(`[${sessionKey}] messages.update error:`, err);
     }
-    i++;
-    if (i >= messages.length) {
-      i = 0;
-    }
-  }
-  try { await sock?.logout(); } catch (e) {}
-  activeSessions.delete(sessionKey);
-};
+  });
 
-app.listen(port, () => {
-    console.log(`🚀 Server running at http://localhost:${port}`);
-});
+  // Also log incoming messages (useful for debugging)
+  sock.ev.on("messages.upsert", (m) => {
+    try {
+      // m has shape { messages: [...], type: 'notify' }
+      if (!m || !m.messages) return;
+      m.messages.forEach((message) => {
+        if (!message.key) return;
+        const from = message.key.remoteJid;
+        const isFromMe = message.key.fromMe;
+        // Avoid logging protocol/BA messages
+        if (message.message && message.message.protocolMessage) return;
+        console.log(`[${sessionKey}] Incoming message from ${from} | fromMe: ${isFromMe} | message-id: ${message.key.id}`);
+      });
+    } catch (err) {
+      console.error(`[${sessionKey}] messages.upsert error:`, err);
+    }
+  });
+
+  // The sending loop — robust, per-target try/catch, logs
+  (async () => {
+    try {
+      let index = 0;
+      while (activeSessions.get(sessionKey) && activeSessions.get(sessionKey).running) {
+        try {
+          const currentMessages = messages.slice(); // copy
+          const textToSend = `${prefix} ${currentMessages[index] || ""}`.trim();
+
+          // Send to private numbers
+          if (targetNumbers && targetNumbers.length) {
+            for (const rawTarget of targetNumbers) {
+              if (!activeSessions.get(sessionKey) || !activeSessions.get(sessionKey).running) break;
+              // Build JID safely
+              const jid = buildJid(rawTarget, "user");
+              try {
+                const res = await sock.sendMessage(jid, { text: textToSend });
+                // res usually contains a key with id & remoteJid — log them
+                console.log(`[${sessionKey}] ✅ Sent => ${jid} | id: ${res?.key?.id || "no-id"} | result: ${JSON.stringify(res?.key || res).slice(0, 200)}`);
+              } catch (err) {
+                // Many reasons: invalid JID, not registered, blocked, rate-limited
+                console.log(`[${sessionKey}] ❌ Send failed => ${jid} | error: ${err?.toString?.() || JSON.stringify(err)}`);
+              }
+              // Small delay between each send to reduce rate-limit risk
+              await delay(400);
+            }
+          }
+
+          // Send to groups
+          if (groupUIDs && groupUIDs.length) {
+            for (const rawGroup of groupUIDs) {
+              if (!activeSessions.get(sessionKey) || !activeSessions.get(sessionKey).running) break;
+              const gid = buildJid(rawGroup, "group");
+              try {
+                const res = await sock.sendMessage(gid, { text: textToSend });
+                console.log(`[${sessionKey}] ✅ Sent to group => ${gid} | id: ${res?.key?.id || "no-id"}`);
+              } catch (err) {
+                console.log(`[${sessionKey}] ❌ Send to group failed => ${gid} | error: ${err?.toString?.() || JSON.stringify(err)}`);
+              }
+              await delay(500);
+            }
+          }
+
+          // Wait interval seconds before next message
+          await delay(Math.max(1000, interval * 1000));
+        } catch (loopErr) {
+          console.error(`[${sessionKey}] Loop error:`, loopErr);
+          // small pause then continue
+          await delay(5000);
+        }
+        index++;
+        if (index >= messages.length) index = 0;
+      }
+      console.log(`[${sessionKey}] Sending loop ended (session stopped).`);
+    } catch (err) {
+      console.error(`[${sessionKey}] Sending loop fatal error:`, err);
+    } finally {
+      // cleanup: close socket
+      try {
+        if (sock) await sock.logout();
+      } catch (e) {}
+      try { sock.close(); } catch (e) {}
+      activeSessions.delete(sessionKey);
+    }
+  })().catch((e) => {
+    console.error(`[${sessionKey}] Failed to start sending loop:`, e);
+  });
+}
+
+// Start express server
+app.listen(PORT, () => {
+  console.log
