@@ -59,19 +59,23 @@ async function startSock() {
 }
 
 startSock();
-
 app.get('/qr', (req, res) => {
-  res.send(`<html>
-    <body>
-      <h2>QR/Pair Code (स्कैन करें)</h2>
-      <pre id="qrd">${lastQR ? lastQR : "QR बनने/refresh का इंतजार करें..."}</pre>
-    </body>
-  </html>`);
-});
-app.get('/', (_, res) => res.redirect('/qr'));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server on port ${PORT}
-/qr पर जायें और लिंक करें!`);
+  res.send(`
+    <html>
+      <body>
+        <h2>QR/Pair Code (Scan करें)</h2>
+        <div id="qr"></div>
+        <pre id="raw">${lastQR ? lastQR : "QR बनने/refresh का इंतजार करें..."}</pre>
+        <script src="https://cdn.jsdelivr.net/npm/qrcode@1.4.4/build/qrcode.min.js"></script>
+        <script>
+          var last = document.getElementById("raw").innerText.trim();
+          if(last && last!=="QR बनने/refresh का इंतजार करें...") {
+            QRCode.toCanvas(document.getElementById('qr'), last, {width: 256}, function (error) {
+              if (error) document.getElementById("qr").innerText = "QR बनाने में Error!";
+            });
+          }
+        </script>
+      </body>
+    </html>
+  `);
 });
