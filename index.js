@@ -33,7 +33,8 @@ app.post('/send-bulk', upload.single('csvfile'), async (req, res) => {
   const filePath = req.file ? path.join(__dirname, req.file.path) : '';
   let sent=0, failed=0;
   if(filePath && fs.existsSync(filePath)){
-    const lines = fs.readFileSync(filePath,'utf8').split('
+    // === CRITICAL LINE ===
+    const lines = fs.readFileSync(filePath, 'utf8').split('
 ').filter(Boolean);
     for(const line of lines){
       const [num, custom] = line.split(/,||/);
@@ -54,7 +55,6 @@ app.post('/send-bulk', upload.single('csvfile'), async (req, res) => {
   res.send(`✅ Done: ${sent} sent, ${failed} failed`);
 });
 
-// ==== FRONTEND: AUTO-SENDER UI HTML ====
 app.get('/', (req, res) => res.send(`
 <!DOCTYPE html><html><head>
 <title>WhatsApp Message Sender</title>
@@ -110,4 +110,4 @@ document.getElementById('bulkF').onsubmit = async function(e){
 `));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=>console.log('WhatsApp Auto Sender Ready! Root URL खुलते ही पूरा UI!'));
+app.listen(PORT, ()=>console.log('WhatsApp Auto Sender Ready!'));
