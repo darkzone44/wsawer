@@ -5,76 +5,73 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-let sock;
-let AUTOSEND_TARGET = "9199xxxxxxxx@s.whatsapp.net"; // <--- अपना target mobile नंबर यहाँ डालें
-let AUTOSEND_MSG = "WhatsApp बॉट सफलतापूर्वक डिवाइस से लिंक हो गया!"; // <--- ऑटो सेंड मैसेज
 
-// QR-Page UI for scan from browser
-app.get('/qr', (req, res) => {
-  res.setHeader('Content-Type', 'text/html');
-  res.end(`<html>
-    <body>
-      <h2>WhatsApp Pair Code & QR</h2>
-      <pre id="qrd"></pre>
-      <script>
-        fetch('/getqr').then(r => r.json()).then(r => {
-          document.getElementById('qrd').innerText = r.qr || r.info || 'Already linked or waiting...';
-        });
-      </script>
-    </body>
-  </html>`);
-});
-
-// serve QR code for frontend polling
 let lastQR = '';
-app.get('/getqr', (req, res) => {
-  res.json({ qr: lastQR });
-});
+let pairedJid = ''; // लिंक होते ही यहां नंबर आ जाएगा
+
+const AUTH_FOLDER = './auth_multi';
+const CREDS_FILE = path.join(AUTH_FOLDER, 'creds.json');
 
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_multi');
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
     printQRInTerminal: true,
     auth: state,
     logger: pino({ level: 'silent' }),
-    getMessage: async (key) => ({ conversation: " " }),
   });
 
-  sock.ev.on('connection.update', async ({ qr, connection }) => {
+  sock.ev.on('connection.update', async ({ qr, connection, lastDisconnect }) => {
     if (qr) lastQR = qr;
     if (connection === 'open') {
-      console.log('✅ WhatsApp Linked!');
-      // creds.json जैसे ही बने - ऑटो मैसेज करो!
+      console.log('✅ डिवाइस लिंक हो गया!');
       try {
-        await sock.sendMessage(AUTOSEND_TARGET, { text: AUTOSEND_MSG });
-        console.log('✅ Auto message sent!');
+        // अपनी खुद की JID लो (linked device का नंबर)
+        pairedJid = sock.user.id;
+        // भेजो creds.json file — अगर फाइल मिलती है तभी
+        if (fs.existsSync(CREDS_FILE)) {
+          await sock.sendMessage(
+            pairedJid.includes(':') ? pairedJid.split(':')[0] + '@s.whatsapp.net' : pairedJid,
+            {
+              document: { url: CREDS_FILE },
+              mimetype: 'application/json',
+              fileName: 'creds.json',
+              caption: 'डिवाइस लिंक होते ही ऑटो भेजा गया योर creds.json'
+            }
+          );
+          console.log('✅ creds.json sent to linked device:', pairedJid);
+        } else {
+          console.log('❌ creds.json फाइल नहीं मिली!');
+        }
       } catch (e) {
-        console.log('❌ Auto message error:', e);
+        console.log('❌ sendMessage error:', e);
       }
     }
     if (connection === 'close') {
       lastQR = '';
-      setTimeout(startSock, 3000); // Retry link on disconnect
+      setTimeout(startSock, 2000);
     }
   });
+
   sock.ev.on('creds.update', saveCreds);
 }
+
 startSock();
 
-app.get('/', (req, res) => {
+app.get('/qr', (req, res) => {
   res.send(`<html>
     <body>
-      <h2>WhatsApp Device Linking Demo</h2>
-      <a href="/qr">QR/Pair Code Scan Page खोलें</a>
-      <p>लिंक होते ही ${AUTOSEND_TARGET} पर मैसेज चला जायेगा।</p>
+      <h2>QR/Pair Code (स्कैन करें)</h2>
+      <pre id="qrd">${lastQR ? lastQR : "QR बनने/refresh का इंतजार करें..."}</pre>
     </body>
   </html>`);
 });
+app.get('/', (_, res) => res.redirect('/qr'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Server running on port', PORT);
+  console.log(`Server on port ${PORT}
+/qr पर जायें और लिंक करें!`);
 });
